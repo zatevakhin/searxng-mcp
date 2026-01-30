@@ -6,8 +6,12 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::config::SearxngFileConfig;
+
 const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 const DEFAULT_LANGUAGE: &str = "en";
+const DEFAULT_NUM_RESULTS: usize = 5;
+const DEFAULT_TIMEOUT_SECS: u64 = 20;
 
 fn parse_csv(s: &str) -> Vec<String> {
     s.split(',')
@@ -29,6 +33,14 @@ impl SafeSearch {
         match s.trim() {
             "0" => Self::None,
             "2" => Self::Strict,
+            _ => Self::Moderate,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::None,
+            2 => Self::Strict,
             _ => Self::Moderate,
         }
     }
@@ -57,42 +69,87 @@ pub struct SearxngConfig {
 impl Default for SearxngConfig {
     fn default() -> Self {
         let version = env!("CARGO_PKG_VERSION");
-        let base_url = std::env::var("SEARXNG_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let default_categories = std::env::var("SEARXNG_DEFAULT_CATEGORIES")
-            .ok()
-            .map(|v| parse_csv(&v))
-            .unwrap_or_default();
-        let default_engines = std::env::var("SEARXNG_DEFAULT_ENGINES")
-            .ok()
-            .map(|v| parse_csv(&v))
-            .unwrap_or_default();
-        let language = std::env::var("SEARXNG_DEFAULT_LANGUAGE")
-            .unwrap_or_else(|_| DEFAULT_LANGUAGE.to_string());
-        let safe_search = std::env::var("SEARXNG_SAFE_SEARCH")
-            .map(|v| SafeSearch::from_env(&v))
-            .unwrap_or(SafeSearch::None);
-        let user_agent = std::env::var("SEARXNG_USER_AGENT")
-            .unwrap_or_else(|_| format!("searxng-mcp/{version}"));
-        let num_results = std::env::var("SEARXNG_NUM_RESULTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(5);
-        let timeout = std::env::var("SEARXNG_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(20));
-
         Self {
-            base_url,
-            default_categories,
-            default_engines,
-            language,
-            safe_search,
-            user_agent,
-            num_results,
-            timeout,
+            base_url: DEFAULT_BASE_URL.to_string(),
+            default_categories: Vec::new(),
+            default_engines: Vec::new(),
+            language: DEFAULT_LANGUAGE.to_string(),
+            safe_search: SafeSearch::None,
+            user_agent: format!("searxng-mcp/{version}"),
+            num_results: DEFAULT_NUM_RESULTS,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         }
+    }
+}
+
+impl SearxngConfig {
+    // Precedence: env > config file > defaults.
+    pub fn from_sources(file: Option<SearxngFileConfig>) -> Self {
+        let mut cfg = Self::default();
+
+        if let Some(file) = file {
+            if let Some(v) = file.base_url {
+                cfg.base_url = v;
+            }
+            if let Some(v) = file.default_categories {
+                cfg.default_categories = v;
+            }
+            if let Some(v) = file.default_engines {
+                cfg.default_engines = v;
+            }
+            if let Some(v) = file.language {
+                cfg.language = v;
+            }
+            if let Some(v) = file.safe_search {
+                cfg.safe_search = SafeSearch::from_u8(v);
+            }
+            if let Some(v) = file.user_agent {
+                cfg.user_agent = v;
+            }
+            if let Some(v) = file.num_results {
+                cfg.num_results = v;
+            }
+            if let Some(v) = file.timeout_secs {
+                cfg.timeout = Duration::from_secs(v);
+            }
+        }
+
+        if let Ok(v) = std::env::var("SEARXNG_BASE_URL")
+            && !v.trim().is_empty()
+        {
+            cfg.base_url = v;
+        }
+        if let Ok(v) = std::env::var("SEARXNG_DEFAULT_CATEGORIES") {
+            cfg.default_categories = parse_csv(&v);
+        }
+        if let Ok(v) = std::env::var("SEARXNG_DEFAULT_ENGINES") {
+            cfg.default_engines = parse_csv(&v);
+        }
+        if let Ok(v) = std::env::var("SEARXNG_DEFAULT_LANGUAGE")
+            && !v.trim().is_empty()
+        {
+            cfg.language = v;
+        }
+        if let Ok(v) = std::env::var("SEARXNG_SAFE_SEARCH") {
+            cfg.safe_search = SafeSearch::from_env(&v);
+        }
+        if let Ok(v) = std::env::var("SEARXNG_USER_AGENT")
+            && !v.trim().is_empty()
+        {
+            cfg.user_agent = v;
+        }
+        if let Ok(v) = std::env::var("SEARXNG_NUM_RESULTS")
+            && let Ok(n) = v.trim().parse::<usize>()
+        {
+            cfg.num_results = n;
+        }
+        if let Ok(v) = std::env::var("SEARXNG_TIMEOUT_SECS")
+            && let Ok(secs) = v.trim().parse::<u64>()
+        {
+            cfg.timeout = Duration::from_secs(secs);
+        }
+
+        cfg
     }
 }
 
@@ -155,7 +212,12 @@ impl SearxngClient {
 
     pub async fn test_connection(&self) -> Result<()> {
         let url = format!("{}/config", self.cfg.base_url.trim_end_matches('/'));
-        let resp = self.http.get(url).send().await.context("config request failed")?;
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("config request failed")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -205,7 +267,12 @@ impl SearxngClient {
             }
         }
 
-        let resp = self.http.get(url).send().await.context("search request failed")?;
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("search request failed")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -233,7 +300,12 @@ impl SearxngClient {
         filter: EngineFilter,
     ) -> Result<HashMap<String, serde_json::Value>> {
         let url = format!("{}/config", self.cfg.base_url.trim_end_matches('/'));
-        let resp = self.http.get(url).send().await.context("config request failed")?;
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("config request failed")?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();

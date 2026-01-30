@@ -48,6 +48,23 @@ nix run . -- --transport streamable-http --bind 127.0.0.1:3344
 
 ## Configuration
 
+### Config file
+
+You can provide a TOML config file:
+
+```bash
+searxng-mcp --config ./config.toml
+```
+
+Example: `config.example.toml`.
+
+Precedence:
+
+- CLI flags
+- environment variables
+- config file
+- defaults
+
 ### Tool allowlist
 
 By default this server exposes only `search,browse`.

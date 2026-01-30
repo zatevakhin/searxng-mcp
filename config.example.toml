@@ -1,0 +1,25 @@
+# Minimal example config for searxng-mcp.
+
+tools = ["search", "browse"]
+
+[searxng]
+base_url = "http://localhost:8080"
+# default_engines = ["duckduckgo", "startpage"]
+# default_categories = ["general"]
+language = "en"
+safe_search = 0
+num_results = 5
+timeout_secs = 20
+
+[browse]
+follow_redirects = false
+max_redirects = 10
+max_bytes = 2000000
+timeout_secs = 20
+# allowed_hosts = ["example.com", "kernel.org"]
+allow_private = false
+
+[streamable_http]
+stateful_mode = true
+# sse_keep_alive_secs = 15
+# sse_retry_secs = 3

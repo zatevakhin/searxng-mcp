@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{collections::HashSet, fmt};
 
@@ -22,6 +23,7 @@ use rmcp::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod browse;
+mod config;
 mod searxng;
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
@@ -53,6 +55,9 @@ struct Args {
         value_name = "TOOL1,TOOL2"
     )]
     tools: Option<String>,
+
+    #[arg(long, value_name = "PATH", help = "Path to a TOML config file")]
+    config: Option<PathBuf>,
 
     #[arg(
         short = 'v',
@@ -153,7 +158,10 @@ impl fmt::Display for ToolName {
 }
 
 fn split_csv(s: &str) -> Vec<&str> {
-    s.split(',').map(|v| v.trim()).filter(|v| !v.is_empty()).collect()
+    s.split(',')
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
 fn parse_enabled_tools(s: &str) -> anyhow::Result<HashSet<ToolName>> {
@@ -183,6 +191,7 @@ fn parse_enabled_tools(s: &str) -> anyhow::Result<HashSet<ToolName>> {
 pub struct SearxngMcpServer {
     tool_router: ToolRouter<Self>,
     searxng: Arc<searxng::SearxngClient>,
+    browse: Arc<browse::BrowseConfig>,
 }
 
 fn truncate_for_log(s: &str, max: usize) -> String {
@@ -197,7 +206,11 @@ fn truncate_for_log(s: &str, max: usize) -> String {
 
 #[tool_router]
 impl SearxngMcpServer {
-    fn new(searxng: Arc<searxng::SearxngClient>, enabled: HashSet<ToolName>) -> Self {
+    fn new(
+        searxng: Arc<searxng::SearxngClient>,
+        browse: Arc<browse::BrowseConfig>,
+        enabled: HashSet<ToolName>,
+    ) -> Self {
         let mut tool_router = Self::tool_router();
         for tool in [
             ToolName::Search,
@@ -211,7 +224,11 @@ impl SearxngMcpServer {
             }
         }
 
-        Self { tool_router, searxng }
+        Self {
+            tool_router,
+            searxng,
+            browse,
+        }
     }
 
     #[tool(description = "Health check")]
@@ -292,11 +309,15 @@ impl SearxngMcpServer {
         tracing::info!(url = %truncate_for_log(&url, 200), "mcp.browse request");
         let started = std::time::Instant::now();
 
-        let md = crate::browse::browse(&url)
+        let md = crate::browse::browse_with_config(&url, self.browse.as_ref())
             .await
             .map_err(|e| McpError::internal_error(format!("browse failed: {e}"), None))?;
 
-        tracing::info!(elapsed_ms = started.elapsed().as_millis(), md_len = md.len(), "mcp.browse response");
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            md_len = md.len(),
+            "mcp.browse response"
+        );
 
         Ok(CallToolResult::success(vec![Content::text(md)]))
     }
@@ -318,7 +339,11 @@ impl SearxngMcpServer {
             .await
             .map_err(|e| McpError::internal_error(format!("get_engines failed: {e}"), None))?;
 
-        tracing::info!(elapsed_ms = started.elapsed().as_millis(), engines = engines.len(), "mcp.engines response");
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            engines = engines.len(),
+            "mcp.engines response"
+        );
 
         let json = serde_json::to_string(&engines)
             .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
@@ -361,7 +386,9 @@ impl SearxngMcpServer {
             "version": VERSION,
             "engines_enabled": engines_count,
         });
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            payload.to_string(),
+        )]))
     }
 }
 
@@ -382,8 +409,16 @@ impl ServerHandler for SearxngMcpServer {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let searxng_cfg = searxng::SearxngConfig::default();
+    let file_cfg = if let Some(path) = args.config.as_deref() {
+        config::load_config(path)?
+    } else {
+        config::FileConfig::default()
+    };
+
+    let searxng_cfg = searxng::SearxngConfig::from_sources(file_cfg.searxng.clone());
     let searxng_client = Arc::new(searxng::SearxngClient::new(searxng_cfg)?);
+
+    let browse_cfg = Arc::new(browse::BrowseConfig::from_sources(file_cfg.browse.clone()));
 
     let log_filter = if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -412,13 +447,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let tools_from_env = std::env::var("SEARXNG_MCP_TOOLS").ok();
+    let tools_from_env = config::csv_tools_from_env();
+    let tools_from_file = file_cfg
+        .tools
+        .as_ref()
+        .map(|v| {
+            v.iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .map(|v| v.join(","));
+
     let tools_str = args
         .tools
-        .as_deref()
-        .or(tools_from_env.as_deref())
-        .unwrap_or("search,browse");
-    let enabled_tools = parse_enabled_tools(tools_str)?;
+        .clone()
+        .or(tools_from_env)
+        .or(tools_from_file)
+        .unwrap_or_else(|| "search,browse".to_string());
+    let enabled_tools = parse_enabled_tools(&tools_str)?;
 
     // Hard requirement: search and browse must stay available.
     if !enabled_tools.contains(&ToolName::Search) || !enabled_tools.contains(&ToolName::Browse) {
@@ -435,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
         Transport::Stdio => {
             let enabled = enabled_tools.clone();
             let service = serve_server(
-                SearxngMcpServer::new(searxng_client.clone(), enabled),
+                SearxngMcpServer::new(searxng_client.clone(), browse_cfg.clone(), enabled),
                 stdio(),
             )
             .await?;
@@ -443,35 +491,45 @@ async fn main() -> anyhow::Result<()> {
             service.cancel().await?;
         }
         Transport::StreamableHttp => {
-            let streamable_http_stateful = std::env::var("STREAMABLE_HTTP_STATEFUL")
-                .map(|s| s.parse().unwrap_or(true))
-                .unwrap_or(true);
+            let mut config = StreamableHttpServerConfig::default();
 
-            let streamable_http_sse_keep_alive = std::env::var("STREAMABLE_HTTP_SSE_KEEP_ALIVE")
+            // Precedence: env > config file > defaults.
+            let file_streamable = file_cfg.streamable_http.clone().unwrap_or_default();
+            let stateful_mode = std::env::var("STREAMABLE_HTTP_STATEFUL")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .map(std::time::Duration::from_secs);
+                .or(file_streamable.stateful_mode)
+                .unwrap_or(config.stateful_mode);
+            config.stateful_mode = stateful_mode;
 
-            let streamable_http_sse_retry = std::env::var("STREAMABLE_HTTP_SSE_RETRY")
+            let keep_alive_secs = std::env::var("STREAMABLE_HTTP_SSE_KEEP_ALIVE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .map(std::time::Duration::from_secs);
+                .or(file_streamable.sse_keep_alive_secs);
+            if let Some(secs) = keep_alive_secs {
+                config.sse_keep_alive = Some(std::time::Duration::from_secs(secs));
+            }
 
-            let config = StreamableHttpServerConfig {
-                sse_keep_alive: streamable_http_sse_keep_alive,
-                sse_retry: streamable_http_sse_retry,
-                stateful_mode: streamable_http_stateful,
-                cancellation_token: shutdown.clone(),
-            };
+            let retry_secs = std::env::var("STREAMABLE_HTTP_SSE_RETRY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or(file_streamable.sse_retry_secs);
+            if let Some(secs) = retry_secs {
+                config.sse_retry = Some(std::time::Duration::from_secs(secs));
+            }
+
+            config.cancellation_token = shutdown.clone();
 
             let session_manager = Arc::new(LocalSessionManager::default());
 
             let searxng_for_service = searxng_client.clone();
             let enabled_for_service = enabled_tools.clone();
+            let browse_for_service = browse_cfg.clone();
             let service = StreamableHttpService::new(
                 move || {
                     Ok(SearxngMcpServer::new(
                         searxng_for_service.clone(),
+                        browse_for_service.clone(),
                         enabled_for_service.clone(),
                     ))
                 },

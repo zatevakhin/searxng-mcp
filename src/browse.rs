@@ -6,6 +6,12 @@ use futures_util::StreamExt;
 use regex::Regex;
 use reqwest::Url;
 
+use crate::config::BrowseFileConfig;
+
+const DEFAULT_MAX_REDIRECTS: usize = 10;
+const DEFAULT_MAX_BYTES: usize = 2_000_000;
+const DEFAULT_TIMEOUT_SECS: u64 = 20;
+
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
         Ok(v) => {
@@ -23,11 +29,99 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 fn parse_csv(s: &str) -> Vec<String> {
     s.split(',')
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty())
         .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowseConfig {
+    pub follow_redirects: bool,
+    pub max_redirects: usize,
+    pub max_bytes: usize,
+    pub timeout: Duration,
+    pub user_agent: String,
+    pub allowed_hosts: Option<Vec<String>>,
+    pub allow_private: bool,
+}
+
+impl Default for BrowseConfig {
+    fn default() -> Self {
+        Self {
+            follow_redirects: false,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            max_bytes: DEFAULT_MAX_BYTES,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            user_agent: format!("searxng-mcp/{}", env!("CARGO_PKG_VERSION")),
+            allowed_hosts: None,
+            allow_private: false,
+        }
+    }
+}
+
+impl BrowseConfig {
+    // Precedence: env > config file > defaults.
+    pub fn from_sources(file: Option<BrowseFileConfig>) -> Self {
+        let mut cfg = Self::default();
+
+        if let Some(file) = file {
+            if let Some(v) = file.follow_redirects {
+                cfg.follow_redirects = v;
+            }
+            if let Some(v) = file.max_redirects {
+                cfg.max_redirects = v;
+            }
+            if let Some(v) = file.max_bytes {
+                cfg.max_bytes = v;
+            }
+            if let Some(v) = file.timeout_secs {
+                cfg.timeout = Duration::from_secs(v);
+            }
+            if let Some(v) = file.user_agent
+                && !v.trim().is_empty()
+            {
+                cfg.user_agent = v;
+            }
+            if let Some(v) = file.allowed_hosts {
+                let v = v
+                    .into_iter()
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect::<Vec<_>>();
+                cfg.allowed_hosts = if v.is_empty() { None } else { Some(v) };
+            }
+            if let Some(v) = file.allow_private {
+                cfg.allow_private = v;
+            }
+        }
+
+        cfg.follow_redirects = env_bool("BROWSE_FOLLOW_REDIRECTS", cfg.follow_redirects);
+        cfg.max_redirects = env_usize("BROWSE_MAX_REDIRECTS", cfg.max_redirects);
+        cfg.max_bytes = env_usize("BROWSE_MAX_BYTES", cfg.max_bytes);
+        if let Some(secs) = env_u64("BROWSE_TIMEOUT_SECS") {
+            cfg.timeout = Duration::from_secs(secs);
+        }
+        if let Ok(v) = std::env::var("BROWSE_USER_AGENT")
+            && !v.trim().is_empty()
+        {
+            cfg.user_agent = v;
+        }
+        if let Ok(v) = std::env::var("BROWSE_ALLOWED_HOSTS") {
+            let list = parse_csv(&v);
+            cfg.allowed_hosts = if list.is_empty() { None } else { Some(list) };
+        }
+        cfg.allow_private = env_bool("BROWSE_ALLOW_PRIVATE", cfg.allow_private);
+
+        cfg
+    }
 }
 
 fn strip_styles_and_scripts(html: &str) -> String {
@@ -75,7 +169,11 @@ fn host_is_obviously_local(host: &str) -> bool {
     h == "localhost" || h.ends_with(".localhost")
 }
 
-fn policy_allows_host(host: &str, allow_private: bool, allowed_hosts: Option<&[String]>) -> Result<()> {
+fn policy_allows_host(
+    host: &str,
+    allow_private: bool,
+    allowed_hosts: Option<&[String]>,
+) -> Result<()> {
     let host_lc = host.to_ascii_lowercase();
 
     // If an explicit allowlist is set, it fully defines what's allowed.
@@ -99,9 +197,9 @@ fn policy_allows_host(host: &str, allow_private: bool, allowed_hosts: Option<&[S
     Ok(())
 }
 
-async fn assert_browse_target_allowed(url: &Url) -> Result<()> {
-    let allow_private = env_bool("BROWSE_ALLOW_PRIVATE", false);
-    let allowed_hosts = std::env::var("BROWSE_ALLOWED_HOSTS").ok().map(|v| parse_csv(&v));
+async fn assert_browse_target_allowed(url: &Url, cfg: &BrowseConfig) -> Result<()> {
+    let allow_private = cfg.allow_private;
+    let allowed_hosts = cfg.allowed_hosts.clone();
 
     let Some(host) = url.host_str() else {
         return Err(anyhow!("url missing host"));
@@ -133,7 +231,9 @@ async fn assert_browse_target_allowed(url: &Url) -> Result<()> {
     for addr in addrs {
         saw_any = true;
         if ip_is_private(addr.ip()) {
-            return Err(anyhow!("refusing to browse host that resolves to private IP (set BROWSE_ALLOW_PRIVATE=true to override)"));
+            return Err(anyhow!(
+                "refusing to browse host that resolves to private IP (set BROWSE_ALLOW_PRIVATE=true to override)"
+            ));
         }
     }
 
@@ -144,30 +244,21 @@ async fn assert_browse_target_allowed(url: &Url) -> Result<()> {
     Ok(())
 }
 
-pub async fn browse(url: &str) -> Result<String> {
+pub async fn browse_with_config(url: &str, cfg: &BrowseConfig) -> Result<String> {
     let url = Url::parse(url).context("invalid url")?;
     match url.scheme() {
         "http" | "https" => {}
         other => return Err(anyhow!("unsupported url scheme: {other}")),
     }
 
-    let follow_redirects = env_bool("BROWSE_FOLLOW_REDIRECTS", false);
-    let max_redirects = env_usize("BROWSE_MAX_REDIRECTS", 10);
-    let max_bytes = env_usize("BROWSE_MAX_BYTES", 2_000_000);
-    let timeout = std::env::var("BROWSE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(20));
-
-    let user_agent = std::env::var("BROWSE_USER_AGENT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("searxng-mcp/{}", env!("CARGO_PKG_VERSION")));
+    let follow_redirects = cfg.follow_redirects;
+    let max_redirects = cfg.max_redirects;
+    let max_bytes = cfg.max_bytes;
+    let timeout = cfg.timeout;
 
     let http = reqwest::ClientBuilder::new()
         .timeout(timeout)
-        .user_agent(user_agent)
+        .user_agent(cfg.user_agent.clone())
         // Follow redirects manually so SSRF checks apply to each hop.
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -175,7 +266,7 @@ pub async fn browse(url: &str) -> Result<String> {
 
     let mut current = url;
     for hop in 0..=max_redirects {
-        assert_browse_target_allowed(&current).await?;
+        assert_browse_target_allowed(&current, cfg).await?;
 
         let resp = http
             .get(current.clone())
@@ -194,7 +285,9 @@ pub async fn browse(url: &str) -> Result<String> {
                 .join(loc)
                 .with_context(|| format!("failed to resolve redirect location '{loc}'"))?;
             if hop == max_redirects {
-                return Err(anyhow!("too many redirects (BROWSE_MAX_REDIRECTS={max_redirects})"));
+                return Err(anyhow!(
+                    "too many redirects (BROWSE_MAX_REDIRECTS={max_redirects})"
+                ));
             }
             continue;
         }
@@ -266,7 +359,9 @@ mod tests {
         assert!(ip_is_private(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
         assert!(ip_is_private(IpAddr::V6("fc00::1".parse().unwrap())));
         assert!(ip_is_private(IpAddr::V6("fe80::1".parse().unwrap())));
-        assert!(!ip_is_private(IpAddr::V6("2606:4700:4700::1111".parse().unwrap())));
+        assert!(!ip_is_private(IpAddr::V6(
+            "2606:4700:4700::1111".parse().unwrap()
+        )));
     }
 
     #[test]
