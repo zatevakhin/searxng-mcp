@@ -1,0 +1,16 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8080:8080"
+
+  searxng-mcp:
+    build: https://github.com/zatevakhin/searxng-mcp.git#main
+    depends_on:
+      - searxng
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080
+      SEARXNG_MCP_TOOLS: search,browse
+    ports:
+      - "3344:3344"
+    command: ["--transport","streamable-http","--bind","0.0.0.0:3344"]

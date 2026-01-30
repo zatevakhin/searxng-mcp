@@ -46,6 +46,19 @@ Run:
 nix run . -- --transport streamable-http --bind 127.0.0.1:3344
 ```
 
+### Docker Compose
+
+Minimal local stack (SearXNG + MCP server) using this repo as a build source:
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- SearXNG on `http://localhost:8080`
+- searxng-mcp on `http://localhost:3344`
+
 ## Configuration
 
 ### Config file
