@@ -401,6 +401,17 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("ctrl-c received, shutting down");
+                shutdown.cancel();
+            }
+        });
+    }
+
     let tools_from_env = std::env::var("SEARXNG_MCP_TOOLS").ok();
     let tools_str = args
         .tools
@@ -428,7 +439,7 @@ async fn main() -> anyhow::Result<()> {
                 stdio(),
             )
             .await?;
-            tokio::signal::ctrl_c().await?;
+            shutdown.cancelled().await;
             service.cancel().await?;
         }
         Transport::StreamableHttp => {
@@ -450,7 +461,7 @@ async fn main() -> anyhow::Result<()> {
                 sse_keep_alive: streamable_http_sse_keep_alive,
                 sse_retry: streamable_http_sse_retry,
                 stateful_mode: streamable_http_stateful,
-                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                cancellation_token: shutdown.clone(),
             };
 
             let session_manager = Arc::new(LocalSessionManager::default());
@@ -470,9 +481,8 @@ async fn main() -> anyhow::Result<()> {
 
             let listener = tokio::net::TcpListener::bind(&args.bind).await?;
             let app = axum::Router::new().fallback_service(service);
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-                tokio::signal::ctrl_c().await.ok();
-            });
+            let server = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await });
 
             server.await?;
         }
