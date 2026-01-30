@@ -5,68 +5,67 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs = inputs@{
-    self,
-    nixpkgs,
-    flake-parts,
-    rust-overlay,
-    ...
-  }:
-    flake-parts.lib.mkFlake {inherit inputs;} {
-      systems = nixpkgs.lib.systems.flakeExposed;
+  outputs = inputs:
+    inputs.flake-parts.lib.mkFlake {inherit inputs;} {
+      systems = inputs.nixpkgs.lib.systems.flakeExposed;
+
+      flake = let
+        searxngMcpModule = import ./nix/nixos-module/searxng-mcp.nix;
+      in {
+        nixosModules = {
+          searxng-mcp = searxngMcpModule;
+          default = searxngMcpModule;
+        };
+      };
 
       perSystem = {
         system,
+        self',
         ...
       }: let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [rust-overlay.overlays.default];
+        overlays = [inputs.rust-overlay.overlays.default];
+        pkgs = import inputs.nixpkgs {
+          inherit system overlays;
         };
 
-        rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
-          extensions = ["rust-src"];
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
         };
 
-        hasCargoToml = builtins.pathExists ./Cargo.toml;
-        hasCargoLock = builtins.pathExists ./Cargo.lock;
-        cargoToml =
-          if hasCargoToml
-          then builtins.fromTOML (builtins.readFile ./Cargo.toml)
-          else {
-            package = {
-              name = "searxng-mcp";
-              version = "0.0.0";
-            };
-          };
-
-        searxng-mcp-pkg = pkgs.rustPlatform.buildRustPackage {
+        searxngMcp = rustPlatform.buildRustPackage {
           pname = cargoToml.package.name;
           version = cargoToml.package.version;
-          src = self;
+          src = pkgs.lib.cleanSource ./.;
 
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+
+          meta = {
+            mainProgram = "searxng-mcp";
+          };
         };
       in {
+        packages.searxng-mcp = searxngMcp;
+        packages.default = searxngMcp;
+
+        apps.searxng-mcp = {
+          type = "app";
+          program = "${self'.packages.searxng-mcp}/bin/searxng-mcp";
+        };
+        apps.default = self'.apps.searxng-mcp;
+
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            rustToolchain
-            openssl
-            pkg-config
-            cacert
-          ];
+          buildInputs = [rustToolchain pkgs.cacert];
 
           shellHook = ''
             export PS1="(env:searxng-mcp) $PS1"
           '';
         };
-
-        packages =
-          if hasCargoToml && hasCargoLock
-          then {default = searxng-mcp-pkg;}
-          else {};
       };
     };
 }
