@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{collections::HashSet, fmt};
 
 use clap::{ArgAction, Parser, ValueEnum};
 use rmcp::{
@@ -41,10 +42,18 @@ impl std::fmt::Display for Transport {
 #[derive(Parser)]
 #[command(name = "searxng-mcp")]
 struct Args {
-    #[arg(short = 'b', long, default_value = "127.0.0.1:3001")]
+    #[arg(short = 'b', long, default_value = "127.0.0.1:3344")]
     bind: String,
     #[arg(short = 't', long, default_value_t = Transport::Stdio)]
     transport: Transport,
+
+    #[arg(
+        long,
+        help = "Comma-separated tool allowlist (default: search,browse). Also supports env SEARXNG_MCP_TOOLS.",
+        value_name = "TOOL1,TOOL2"
+    )]
+    tools: Option<String>,
+
     #[arg(
         short = 'v',
         long,
@@ -105,6 +114,71 @@ pub struct HealthRequest {
     pub include_engines: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum ToolName {
+    Search,
+    Browse,
+    Engines,
+    Health,
+    Ping,
+}
+
+impl ToolName {
+    fn as_str(self) -> &'static str {
+        match self {
+            ToolName::Search => "search",
+            ToolName::Browse => "browse",
+            ToolName::Engines => "engines",
+            ToolName::Health => "health",
+            ToolName::Ping => "ping",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "search" => Some(Self::Search),
+            "browse" => Some(Self::Browse),
+            "engines" => Some(Self::Engines),
+            "health" => Some(Self::Health),
+            "ping" => Some(Self::Ping),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ToolName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn split_csv(s: &str) -> Vec<&str> {
+    s.split(',').map(|v| v.trim()).filter(|v| !v.is_empty()).collect()
+}
+
+fn parse_enabled_tools(s: &str) -> anyhow::Result<HashSet<ToolName>> {
+    let mut out = HashSet::new();
+    let mut unknown = Vec::new();
+
+    for part in split_csv(s) {
+        match ToolName::parse(part) {
+            Some(t) => {
+                out.insert(t);
+            }
+            None => unknown.push(part.to_string()),
+        }
+    }
+
+    if !unknown.is_empty() {
+        return Err(anyhow::anyhow!(
+            "unknown tools: {} (valid: search,browse,engines,health,ping)",
+            unknown.join(",")
+        ));
+    }
+
+    Ok(out)
+}
+
 #[derive(Debug, Clone)]
 pub struct SearxngMcpServer {
     tool_router: ToolRouter<Self>,
@@ -123,11 +197,21 @@ fn truncate_for_log(s: &str, max: usize) -> String {
 
 #[tool_router]
 impl SearxngMcpServer {
-    pub fn new(searxng: Arc<searxng::SearxngClient>) -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-            searxng,
+    fn new(searxng: Arc<searxng::SearxngClient>, enabled: HashSet<ToolName>) -> Self {
+        let mut tool_router = Self::tool_router();
+        for tool in [
+            ToolName::Search,
+            ToolName::Browse,
+            ToolName::Engines,
+            ToolName::Health,
+            ToolName::Ping,
+        ] {
+            if !enabled.contains(&tool) {
+                tool_router.remove_route(tool.as_str());
+            }
         }
+
+        Self { tool_router, searxng }
     }
 
     #[tool(description = "Health check")]
@@ -286,7 +370,7 @@ impl ServerHandler for SearxngMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "SearXNG MCP server (standalone). Tools: ping (more coming)".into(),
+                "SearXNG MCP server (standalone). Default tools: search,browse.".into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
@@ -317,13 +401,33 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
+    let tools_from_env = std::env::var("SEARXNG_MCP_TOOLS").ok();
+    let tools_str = args
+        .tools
+        .as_deref()
+        .or(tools_from_env.as_deref())
+        .unwrap_or("search,browse");
+    let enabled_tools = parse_enabled_tools(tools_str)?;
+
+    // Hard requirement: search and browse must stay available.
+    if !enabled_tools.contains(&ToolName::Search) || !enabled_tools.contains(&ToolName::Browse) {
+        return Err(anyhow::anyhow!(
+            "tools must include search,browse (got: {tools_str})"
+        ));
+    }
+
     if args.transport != Transport::Stdio {
         tracing::info!(version = VERSION, transport = %args.transport, bind = %args.bind, "server starting");
     }
 
     match args.transport {
         Transport::Stdio => {
-            let service = serve_server(SearxngMcpServer::new(searxng_client.clone()), stdio()).await?;
+            let enabled = enabled_tools.clone();
+            let service = serve_server(
+                SearxngMcpServer::new(searxng_client.clone(), enabled),
+                stdio(),
+            )
+            .await?;
             tokio::signal::ctrl_c().await?;
             service.cancel().await?;
         }
@@ -352,8 +456,14 @@ async fn main() -> anyhow::Result<()> {
             let session_manager = Arc::new(LocalSessionManager::default());
 
             let searxng_for_service = searxng_client.clone();
+            let enabled_for_service = enabled_tools.clone();
             let service = StreamableHttpService::new(
-                move || Ok(SearxngMcpServer::new(searxng_for_service.clone())),
+                move || {
+                    Ok(SearxngMcpServer::new(
+                        searxng_for_service.clone(),
+                        enabled_for_service.clone(),
+                    ))
+                },
                 session_manager,
                 config,
             );

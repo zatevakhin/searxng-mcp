@@ -40,6 +40,12 @@ in {
       '';
     };
 
+    tools = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = ["search" "browse"];
+      description = "Tool allowlist passed as --tools (default: search,browse).";
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [];
@@ -65,7 +71,7 @@ in {
         WorkingDirectory = "%S/searxng-mcp";
 
         ExecStart =
-          "${cfg.package}/bin/searxng-mcp --transport streamable-http --bind ${cfg.listenAddress}:${toString cfg.port} ${lib.escapeShellArgs cfg.extraArgs}";
+          "${cfg.package}/bin/searxng-mcp --transport streamable-http --bind ${cfg.listenAddress}:${toString cfg.port} --tools ${lib.concatStringsSep "," cfg.tools} ${lib.escapeShellArgs cfg.extraArgs}";
         Restart = "on-failure";
         RestartSec = 1;
 
