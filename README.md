@@ -163,7 +163,7 @@ Example flake-based NixOS config:
 
 ```nix
 {
-  inputs.searxng-mcp.url = "github:YOUR_ORG/searxng-mcp";
+  inputs.searxng-mcp.url = "github:zatevakhin/searxng-mcp";
 
   outputs = { self, nixpkgs, searxng-mcp, ... }:
   let
