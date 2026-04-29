@@ -27,6 +27,8 @@ pub struct SearxngFileConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseFileConfig {
+    pub backend: Option<String>,
+    pub format: Option<String>,
     pub follow_redirects: Option<bool>,
     pub max_redirects: Option<usize>,
     pub max_bytes: Option<usize>,

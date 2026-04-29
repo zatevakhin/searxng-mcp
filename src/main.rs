@@ -105,6 +105,18 @@ pub struct SearchRequest {
 pub struct BrowseRequest {
     #[schemars(description = "The URL to browse")]
     pub url: String,
+
+    #[schemars(description = "Output format: markdown or text")]
+    pub format: Option<browse::BrowseFormat>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BrowseEvalRequest {
+    #[schemars(description = "The URL to browse")]
+    pub url: String,
+
+    #[schemars(description = "JavaScript expression to evaluate after load")]
+    pub script: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -123,6 +135,7 @@ pub struct HealthRequest {
 enum ToolName {
     Search,
     Browse,
+    BrowseEval,
     Engines,
     Health,
     Ping,
@@ -133,6 +146,7 @@ impl ToolName {
         match self {
             ToolName::Search => "search",
             ToolName::Browse => "browse",
+            ToolName::BrowseEval => "browse_eval",
             ToolName::Engines => "engines",
             ToolName::Health => "health",
             ToolName::Ping => "ping",
@@ -143,6 +157,7 @@ impl ToolName {
         match s.trim().to_ascii_lowercase().as_str() {
             "search" => Some(Self::Search),
             "browse" => Some(Self::Browse),
+            "browse_eval" => Some(Self::BrowseEval),
             "engines" => Some(Self::Engines),
             "health" => Some(Self::Health),
             "ping" => Some(Self::Ping),
@@ -179,7 +194,7 @@ fn parse_enabled_tools(s: &str) -> anyhow::Result<HashSet<ToolName>> {
 
     if !unknown.is_empty() {
         return Err(anyhow::anyhow!(
-            "unknown tools: {} (valid: search,browse,engines,health,ping)",
+            "unknown tools: {} (valid: search,browse,browse_eval,engines,health,ping)",
             unknown.join(",")
         ));
     }
@@ -215,6 +230,7 @@ impl SearxngMcpServer {
         for tool in [
             ToolName::Search,
             ToolName::Browse,
+            ToolName::BrowseEval,
             ToolName::Engines,
             ToolName::Health,
             ToolName::Ping,
@@ -297,7 +313,7 @@ impl SearxngMcpServer {
     async fn browse(
         &self,
         _context: RequestContext<RoleServer>,
-        Parameters(BrowseRequest { url }): Parameters<BrowseRequest>,
+        Parameters(BrowseRequest { url, format }): Parameters<BrowseRequest>,
     ) -> Result<CallToolResult, McpError> {
         if url.trim().is_empty() {
             return Err(McpError::internal_error(
@@ -309,7 +325,7 @@ impl SearxngMcpServer {
         tracing::info!(url = %truncate_for_log(&url, 200), "mcp.browse request");
         let started = std::time::Instant::now();
 
-        let md = crate::browse::browse_with_config(&url, self.browse.as_ref())
+        let md = crate::browse::browse_with_config(&url, format, self.browse.as_ref())
             .await
             .map_err(|e| McpError::internal_error(format!("browse failed: {e}"), None))?;
 
@@ -320,6 +336,47 @@ impl SearxngMcpServer {
         );
 
         Ok(CallToolResult::success(vec![Content::text(md)]))
+    }
+
+    #[tool(description = "Evaluate JavaScript on a loaded page using the Obscura browse backend")]
+    async fn browse_eval(
+        &self,
+        _context: RequestContext<RoleServer>,
+        Parameters(BrowseEvalRequest { url, script }): Parameters<BrowseEvalRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if url.trim().is_empty() {
+            return Err(McpError::internal_error(
+                "url must be non-empty".to_string(),
+                None,
+            ));
+        }
+        if script.trim().is_empty() {
+            return Err(McpError::internal_error(
+                "script must be non-empty".to_string(),
+                None,
+            ));
+        }
+        if self.browse.backend != browse::BrowseBackend::Obscura {
+            return Err(McpError::internal_error(
+                "browse_eval requires BROWSE_BACKEND=obscura".to_string(),
+                None,
+            ));
+        }
+
+        tracing::info!(url = %truncate_for_log(&url, 200), "mcp.browse_eval request");
+        let started = std::time::Instant::now();
+
+        let result = crate::browse::browse_eval_with_config(&url, &script, self.browse.as_ref())
+            .await
+            .map_err(|e| McpError::internal_error(format!("browse_eval failed: {e}"), None))?;
+
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            result_len = result.len(),
+            "mcp.browse_eval response"
+        );
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     #[tool(description = "List configured SearXNG engines")]
@@ -418,7 +475,7 @@ async fn main() -> anyhow::Result<()> {
     let searxng_cfg = searxng::SearxngConfig::from_sources(file_cfg.searxng.clone());
     let searxng_client = Arc::new(searxng::SearxngClient::new(searxng_cfg)?);
 
-    let browse_cfg = Arc::new(browse::BrowseConfig::from_sources(file_cfg.browse.clone()));
+    let browse_cfg = Arc::new(browse::BrowseConfig::from_sources(file_cfg.browse.clone())?);
 
     let log_filter = if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -472,6 +529,13 @@ async fn main() -> anyhow::Result<()> {
     if !enabled_tools.contains(&ToolName::Search) || !enabled_tools.contains(&ToolName::Browse) {
         return Err(anyhow::anyhow!(
             "tools must include search,browse (got: {tools_str})"
+        ));
+    }
+    if enabled_tools.contains(&ToolName::BrowseEval)
+        && browse_cfg.backend != browse::BrowseBackend::Obscura
+    {
+        return Err(anyhow::anyhow!(
+            "browse_eval requires BROWSE_BACKEND=obscura"
         ));
     }
 

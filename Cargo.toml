@@ -3,12 +3,18 @@ name = "searxng-mcp"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+obscura-backend = ["dep:obscura-browser"]
+obscura-stealth = ["obscura-backend", "obscura-browser/stealth"]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 html2md = "0.2"
+obscura-browser = { git = "https://github.com/h4ckf0r0day/obscura", rev = "53a04fa", optional = true }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "brotli", "gzip", "deflate"] }
 rmcp = { version = "0.14", features = ["macros", "server", "transport-async-rw", "transport-streamable-http-server", "transport-io", "schemars", "elicitation"] }

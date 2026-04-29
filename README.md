@@ -5,7 +5,8 @@ Standalone Model Context Protocol (MCP) server for SearXNG.
 Tools exposed:
 
 - `search`: Query a SearXNG instance and return JSON results
-- `browse`: Fetch a URL and return Markdown
+- `browse`: Fetch a URL and return Markdown or text
+- `browse_eval`: Evaluate JavaScript on a loaded page (Obscura backend only)
 - `engines`: List configured SearXNG engines (from `/config`)
 - `health`: Check connectivity to SearXNG (`/config`)
 - `ping`: Basic health check
@@ -107,8 +108,12 @@ export SEARXNG_MCP_TOOLS=search,browse,health
 
 ### Browse
 
-- `BROWSE_FOLLOW_REDIRECTS` (`true|false`, default: `false`)
-- `BROWSE_MAX_REDIRECTS` (default: `10`)
+- `BROWSE_BACKEND` (`simple|obscura`, default: `simple`; `obscura` requires `--features obscura-backend`)
+- `BROWSE_OBSCURA_WAIT_UNTIL` (`load|domload|idle0|idle2`, default: `load`; Obscura backend only)
+- `BROWSE_OBSCURA_STEALTH` (`true|false|1|0|yes|no|on|off`, default: `false`; env-only; `true` requires `--features obscura-stealth`)
+- `browse.format` in config or the `browse` tool `format` argument (`markdown|text`, default: `markdown`)
+- `BROWSE_FOLLOW_REDIRECTS` (`true|false`, default: `false`; simple backend only)
+- `BROWSE_MAX_REDIRECTS` (default: `10`; simple backend only)
 - `BROWSE_MAX_BYTES` (default: `2000000`)
 - `BROWSE_TIMEOUT_SECS` (default: `20`)
 - `BROWSE_USER_AGENT` (default: `searxng-mcp/<version>`)
@@ -122,6 +127,21 @@ Notes:
 
 - If `BROWSE_ALLOWED_HOSTS` is set, it overrides private/localhost blocking.
 - If no allowlist is set, `browse` blocks localhost and private/loopback/link-local IPs by default.
+- The Obscura backend uses the in-process Rust API and its navigation wait mode is controlled by `BROWSE_OBSCURA_WAIT_UNTIL`.
+- Enable `browse_eval` with `--tools search,browse,browse_eval` only when using `BROWSE_BACKEND=obscura`.
+
+Build with Obscura support:
+
+```bash
+cargo build --features obscura-backend
+```
+
+Build and run with Obscura stealth:
+
+```bash
+cargo build --features obscura-stealth
+BROWSE_BACKEND=obscura BROWSE_OBSCURA_STEALTH=true cargo run --features obscura-stealth -- --tools search,browse
+```
 
 ## MCP Client Examples
 

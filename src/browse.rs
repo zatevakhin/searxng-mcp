@@ -1,4 +1,6 @@
 use std::net::IpAddr;
+#[cfg(feature = "obscura-backend")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -22,6 +24,24 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+fn env_bool_strict(key: &str) -> Result<Option<bool>> {
+    let Ok(value) = std::env::var(key) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(Some(true)),
+        "false" | "0" | "no" | "off" => Ok(Some(false)),
+        other => Err(anyhow!(
+            "invalid {key} '{other}' (valid: true,false,1,0,yes,no,on,off)"
+        )),
+    }
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -42,8 +62,77 @@ fn parse_csv(s: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseBackend {
+    Simple,
+    Obscura,
+}
+
+impl BrowseBackend {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "simple" => Ok(Self::Simple),
+            "obscura" => Ok(Self::Obscura),
+            other => Err(anyhow!(
+                "invalid browse backend '{other}' (valid: simple,obscura)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowseFormat {
+    Markdown,
+    Text,
+}
+
+impl Default for BrowseFormat {
+    fn default() -> Self {
+        Self::Markdown
+    }
+}
+
+impl BrowseFormat {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "markdown" => Ok(Self::Markdown),
+            "text" => Ok(Self::Text),
+            other => Err(anyhow!(
+                "invalid browse format '{other}' (valid: markdown,text)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObscuraWaitUntil {
+    Load,
+    DomLoad,
+    Idle0,
+    Idle2,
+}
+
+impl ObscuraWaitUntil {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "load" => Ok(Self::Load),
+            "domload" => Ok(Self::DomLoad),
+            "idle0" => Ok(Self::Idle0),
+            "idle2" => Ok(Self::Idle2),
+            other => Err(anyhow!(
+                "invalid BROWSE_OBSCURA_WAIT_UNTIL '{other}' (valid: load,domload,idle0,idle2)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BrowseConfig {
+    pub backend: BrowseBackend,
+    pub format: BrowseFormat,
+    pub obscura_wait_until: ObscuraWaitUntil,
+    pub obscura_stealth: bool,
     pub follow_redirects: bool,
     pub max_redirects: usize,
     pub max_bytes: usize,
@@ -56,6 +145,10 @@ pub struct BrowseConfig {
 impl Default for BrowseConfig {
     fn default() -> Self {
         Self {
+            backend: BrowseBackend::Simple,
+            format: BrowseFormat::Markdown,
+            obscura_wait_until: ObscuraWaitUntil::Load,
+            obscura_stealth: false,
             follow_redirects: false,
             max_redirects: DEFAULT_MAX_REDIRECTS,
             max_bytes: DEFAULT_MAX_BYTES,
@@ -69,10 +162,16 @@ impl Default for BrowseConfig {
 
 impl BrowseConfig {
     // Precedence: env > config file > defaults.
-    pub fn from_sources(file: Option<BrowseFileConfig>) -> Self {
+    pub fn from_sources(file: Option<BrowseFileConfig>) -> Result<Self> {
         let mut cfg = Self::default();
 
         if let Some(file) = file {
+            if let Some(v) = file.backend {
+                cfg.backend = BrowseBackend::parse(&v)?;
+            }
+            if let Some(v) = file.format {
+                cfg.format = BrowseFormat::parse(&v)?;
+            }
             if let Some(v) = file.follow_redirects {
                 cfg.follow_redirects = v;
             }
@@ -103,6 +202,22 @@ impl BrowseConfig {
             }
         }
 
+        if let Ok(v) = std::env::var("BROWSE_BACKEND")
+            && !v.trim().is_empty()
+        {
+            cfg.backend = BrowseBackend::parse(&v)?;
+        }
+        if let Ok(v) = std::env::var("BROWSE_OBSCURA_WAIT_UNTIL") {
+            cfg.obscura_wait_until = ObscuraWaitUntil::parse(&v)?;
+        }
+        if let Some(v) = env_bool_strict("BROWSE_OBSCURA_STEALTH")? {
+            cfg.obscura_stealth = v;
+        }
+        if cfg.obscura_stealth && !cfg!(feature = "obscura-stealth") {
+            return Err(anyhow!(
+                "BROWSE_OBSCURA_STEALTH=true requires building with --features obscura-stealth"
+            ));
+        }
         cfg.follow_redirects = env_bool("BROWSE_FOLLOW_REDIRECTS", cfg.follow_redirects);
         cfg.max_redirects = env_usize("BROWSE_MAX_REDIRECTS", cfg.max_redirects);
         cfg.max_bytes = env_usize("BROWSE_MAX_BYTES", cfg.max_bytes);
@@ -120,7 +235,7 @@ impl BrowseConfig {
         }
         cfg.allow_private = env_bool("BROWSE_ALLOW_PRIVATE", cfg.allow_private);
 
-        cfg
+        Ok(cfg)
     }
 }
 
@@ -244,7 +359,85 @@ async fn assert_browse_target_allowed(url: &Url, cfg: &BrowseConfig) -> Result<(
     Ok(())
 }
 
-pub async fn browse_with_config(url: &str, cfg: &BrowseConfig) -> Result<String> {
+fn decode_html_entities(text: &str) -> String {
+    let mut decoded = text
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+
+    let numeric_entity = Regex::new(r"&#(x?[0-9A-Fa-f]+);").expect("valid regex");
+    decoded = numeric_entity
+        .replace_all(&decoded, |caps: &regex::Captures<'_>| {
+            let raw = &caps[1];
+            let parsed = if let Some(hex) = raw.strip_prefix('x').or_else(|| raw.strip_prefix('X'))
+            {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                raw.parse::<u32>().ok()
+            };
+
+            parsed
+                .and_then(char::from_u32)
+                .map(|ch| ch.to_string())
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .into_owned();
+
+    decoded
+}
+
+fn render_text(html: &str) -> String {
+    let breaks = Regex::new(r"(?is)</?(?:address|article|aside|blockquote|br|div|dl|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|table|tbody|td|tfoot|th|thead|tr|ul)[^>]*>")
+        .expect("valid regex");
+    let without_tags = Regex::new(r"(?is)<[^>]+>").expect("valid regex");
+    let whitespace = Regex::new(r"[ \t\x0C\r]+").expect("valid regex");
+    let newline_runs = Regex::new(r"\n{3,}").expect("valid regex");
+
+    let with_breaks = breaks.replace_all(html, "\n");
+    let stripped = without_tags.replace_all(&with_breaks, " ");
+    let decoded = decode_html_entities(&stripped);
+    let normalized = whitespace.replace_all(&decoded, " ");
+    let normalized = normalized.replace("\n ", "\n").replace(" \n", "\n");
+    newline_runs
+        .replace_all(normalized.trim(), "\n\n")
+        .into_owned()
+}
+
+fn render_html(html: &str, format: BrowseFormat) -> String {
+    let cleaned = strip_styles_and_scripts(html);
+    match format {
+        BrowseFormat::Markdown => html2md::parse_html(&cleaned),
+        BrowseFormat::Text => render_text(&cleaned),
+    }
+}
+
+fn enforce_max_bytes(output: String, max_bytes: usize, what: &str) -> Result<String> {
+    if output.len() > max_bytes {
+        return Err(anyhow!("{what} exceeded BROWSE_MAX_BYTES ({max_bytes})"));
+    }
+    Ok(output)
+}
+
+pub async fn browse_with_config(
+    url: &str,
+    format: Option<BrowseFormat>,
+    cfg: &BrowseConfig,
+) -> Result<String> {
+    let format = format.unwrap_or(cfg.format);
+    match cfg.backend {
+        BrowseBackend::Simple => browse_simple_with_config(url, format, cfg).await,
+        BrowseBackend::Obscura => browse_obscura_with_config(url, format, cfg).await,
+    }
+}
+
+async fn browse_simple_with_config(
+    url: &str,
+    format: BrowseFormat,
+    cfg: &BrowseConfig,
+) -> Result<String> {
     let url = Url::parse(url).context("invalid url")?;
     match url.scheme() {
         "http" | "https" => {}
@@ -324,11 +517,145 @@ pub async fn browse_with_config(url: &str, cfg: &BrowseConfig) -> Result<String>
         }
 
         let html = String::from_utf8(buf).context("response was not valid utf-8")?;
-        let cleaned = strip_styles_and_scripts(&html);
-        return Ok(html2md::parse_html(&cleaned));
+        let output = render_html(&html, format);
+        return enforce_max_bytes(output, max_bytes, "rendered output");
     }
 
     Err(anyhow!("unreachable"))
+}
+
+#[cfg(feature = "obscura-backend")]
+async fn new_obscura_page(cfg: &BrowseConfig) -> Result<obscura_browser::Page> {
+    let context = Arc::new(obscura_browser::BrowserContext::with_options(
+        "browse".to_string(),
+        None,
+        cfg.obscura_stealth,
+    ));
+    let page = obscura_browser::Page::new("browse-page".to_string(), context);
+    page.http_client.set_user_agent(&cfg.user_agent).await;
+    Ok(page)
+}
+
+#[cfg(feature = "obscura-backend")]
+async fn navigate_obscura_page(
+    page: &mut obscura_browser::Page,
+    url: &str,
+    cfg: &BrowseConfig,
+) -> Result<()> {
+    let parsed = Url::parse(url).context("invalid url")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(anyhow!("unsupported url scheme: {other}")),
+    }
+    let wait_until = match cfg.obscura_wait_until {
+        ObscuraWaitUntil::Load => obscura_browser::WaitUntil::Load,
+        ObscuraWaitUntil::DomLoad => obscura_browser::WaitUntil::DomContentLoaded,
+        ObscuraWaitUntil::Idle0 => obscura_browser::WaitUntil::NetworkIdle0,
+        ObscuraWaitUntil::Idle2 => obscura_browser::WaitUntil::NetworkIdle2,
+    };
+    tokio::time::timeout(cfg.timeout, async {
+        assert_browse_target_allowed(&parsed, cfg).await?;
+        page.navigate_with_wait(url, wait_until)
+            .await
+            .map_err(|e| anyhow!("obscura navigation failed: {e}"))
+    })
+    .await
+    .map_err(|_| anyhow!("obscura navigation timed out after {:?}", cfg.timeout))?
+}
+
+#[cfg(feature = "obscura-backend")]
+async fn browse_obscura_with_config(
+    url: &str,
+    format: BrowseFormat,
+    cfg: &BrowseConfig,
+) -> Result<String> {
+    let url = url.to_string();
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build Obscura runtime")?;
+        rt.block_on(async move {
+            let mut page = new_obscura_page(&cfg).await?;
+            navigate_obscura_page(&mut page, &url, &cfg).await?;
+            let output = tokio::time::timeout(cfg.timeout, async {
+                page.with_dom(|dom| match format {
+                    BrowseFormat::Markdown => {
+                        let html = if let Ok(Some(html_node)) = dom.query_selector("html") {
+                            dom.outer_html(html_node)
+                        } else {
+                            dom.inner_html(dom.document())
+                        };
+                        render_html(&html, BrowseFormat::Markdown)
+                    }
+                    BrowseFormat::Text => {
+                        if let Ok(Some(body)) = dom.query_selector("body") {
+                            dom.text_content(body)
+                        } else {
+                            String::new()
+                        }
+                    }
+                })
+                .unwrap_or_default()
+            })
+            .await
+            .map_err(|_| anyhow!("obscura render timed out after {:?}", cfg.timeout))?;
+            enforce_max_bytes(output, cfg.max_bytes, "rendered output")
+        })
+    })
+    .await
+    .context("Obscura task failed")?
+}
+
+#[cfg(not(feature = "obscura-backend"))]
+async fn browse_obscura_with_config(
+    _url: &str,
+    _format: BrowseFormat,
+    _cfg: &BrowseConfig,
+) -> Result<String> {
+    Err(anyhow!(
+        "BROWSE_BACKEND=obscura requires building with --features obscura-backend"
+    ))
+}
+
+#[cfg(feature = "obscura-backend")]
+pub async fn browse_eval_with_config(
+    url: &str,
+    script: &str,
+    cfg: &BrowseConfig,
+) -> Result<String> {
+    let url = url.to_string();
+    let script = script.to_string();
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build Obscura runtime")?;
+        rt.block_on(async move {
+            let mut page = new_obscura_page(&cfg).await?;
+            navigate_obscura_page(&mut page, &url, &cfg).await?;
+            let output =
+                tokio::time::timeout(cfg.timeout, async { page.evaluate(&script).to_string() })
+                    .await
+                    .map_err(|_| anyhow!("obscura eval timed out after {:?}", cfg.timeout))?;
+            enforce_max_bytes(output, cfg.max_bytes, "evaluation output")
+        })
+    })
+    .await
+    .context("Obscura task failed")?
+}
+
+#[cfg(not(feature = "obscura-backend"))]
+pub async fn browse_eval_with_config(
+    _url: &str,
+    _script: &str,
+    _cfg: &BrowseConfig,
+) -> Result<String> {
+    Err(anyhow!(
+        "browse_eval requires building with --features obscura-backend"
+    ))
 }
 
 #[cfg(test)]

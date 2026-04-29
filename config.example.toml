@@ -1,6 +1,7 @@
 # Minimal example config for searxng-mcp.
 
 tools = ["search", "browse"]
+# Add "browse_eval" only when BROWSE_BACKEND=obscura and the binary is built with --features obscura-backend.
 
 [searxng]
 base_url = "http://localhost:8080"
@@ -12,6 +13,8 @@ num_results = 5
 timeout_secs = 20
 
 [browse]
+backend = "simple" # "simple" or "obscura"; obscura requires --features obscura-backend.
+format = "markdown" # "markdown" or "text"
 follow_redirects = false
 max_redirects = 10
 max_bytes = 2000000
