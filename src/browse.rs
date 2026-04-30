@@ -8,8 +8,6 @@ use futures_util::StreamExt;
 use regex::Regex;
 use reqwest::Url;
 
-use crate::config::BrowseFileConfig;
-
 const DEFAULT_MAX_REDIRECTS: usize = 10;
 const DEFAULT_MAX_BYTES: usize = 2_000_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
@@ -80,29 +78,12 @@ impl BrowseBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowseFormat {
+    #[default]
     Markdown,
     Text,
-}
-
-impl Default for BrowseFormat {
-    fn default() -> Self {
-        Self::Markdown
-    }
-}
-
-impl BrowseFormat {
-    fn parse(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "markdown" => Ok(Self::Markdown),
-            "text" => Ok(Self::Text),
-            other => Err(anyhow!(
-                "invalid browse format '{other}' (valid: markdown,text)"
-            )),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,46 +142,8 @@ impl Default for BrowseConfig {
 }
 
 impl BrowseConfig {
-    // Precedence: env > config file > defaults.
-    pub fn from_sources(file: Option<BrowseFileConfig>) -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         let mut cfg = Self::default();
-
-        if let Some(file) = file {
-            if let Some(v) = file.backend {
-                cfg.backend = BrowseBackend::parse(&v)?;
-            }
-            if let Some(v) = file.format {
-                cfg.format = BrowseFormat::parse(&v)?;
-            }
-            if let Some(v) = file.follow_redirects {
-                cfg.follow_redirects = v;
-            }
-            if let Some(v) = file.max_redirects {
-                cfg.max_redirects = v;
-            }
-            if let Some(v) = file.max_bytes {
-                cfg.max_bytes = v;
-            }
-            if let Some(v) = file.timeout_secs {
-                cfg.timeout = Duration::from_secs(v);
-            }
-            if let Some(v) = file.user_agent
-                && !v.trim().is_empty()
-            {
-                cfg.user_agent = v;
-            }
-            if let Some(v) = file.allowed_hosts {
-                let v = v
-                    .into_iter()
-                    .map(|h| h.trim().to_ascii_lowercase())
-                    .filter(|h| !h.is_empty())
-                    .collect::<Vec<_>>();
-                cfg.allowed_hosts = if v.is_empty() { None } else { Some(v) };
-            }
-            if let Some(v) = file.allow_private {
-                cfg.allow_private = v;
-            }
-        }
 
         if let Ok(v) = std::env::var("BROWSE_BACKEND")
             && !v.trim().is_empty()
@@ -532,7 +475,9 @@ async fn new_obscura_page(cfg: &BrowseConfig) -> Result<obscura_browser::Page> {
         cfg.obscura_stealth,
     ));
     let page = obscura_browser::Page::new("browse-page".to_string(), context);
-    page.http_client.set_user_agent(&cfg.user_agent).await;
+    if !cfg.obscura_stealth {
+        page.http_client.set_user_agent(&cfg.user_agent).await;
+    }
     Ok(page)
 }
 

@@ -29,25 +29,13 @@
         };
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rustToolchain;
           rustc = rustToolchain;
         };
 
-        searxngMcp = rustPlatform.buildRustPackage {
-          pname = cargoToml.package.name;
-          version = cargoToml.package.version;
-          src = pkgs.lib.cleanSource ./.;
-
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
-
-          meta = {
-            mainProgram = "searxng-mcp";
-          };
+        searxngMcp = pkgs.callPackage ./nix/package.nix {
+          inherit rustPlatform;
         };
       in {
         packages.searxng-mcp = searxngMcp;

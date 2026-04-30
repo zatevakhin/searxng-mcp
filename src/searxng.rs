@@ -6,8 +6,6 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::config::SearxngFileConfig;
-
 const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 const DEFAULT_LANGUAGE: &str = "en";
 const DEFAULT_NUM_RESULTS: usize = 5;
@@ -36,14 +34,6 @@ impl SafeSearch {
             _ => Self::Moderate,
         }
     }
-
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::None,
-            2 => Self::Strict,
-            _ => Self::Moderate,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, schemars::JsonSchema, serde::Deserialize)]
@@ -61,21 +51,18 @@ pub struct SearxngConfig {
     pub default_engines: Vec<String>,
     pub language: String,
     pub safe_search: SafeSearch,
-    pub user_agent: String,
     pub num_results: usize,
     pub timeout: Duration,
 }
 
 impl Default for SearxngConfig {
     fn default() -> Self {
-        let version = env!("CARGO_PKG_VERSION");
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
             default_categories: Vec::new(),
             default_engines: Vec::new(),
             language: DEFAULT_LANGUAGE.to_string(),
             safe_search: SafeSearch::None,
-            user_agent: format!("searxng-mcp/{version}"),
             num_results: DEFAULT_NUM_RESULTS,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         }
@@ -83,36 +70,8 @@ impl Default for SearxngConfig {
 }
 
 impl SearxngConfig {
-    // Precedence: env > config file > defaults.
-    pub fn from_sources(file: Option<SearxngFileConfig>) -> Self {
+    pub fn from_env() -> Self {
         let mut cfg = Self::default();
-
-        if let Some(file) = file {
-            if let Some(v) = file.base_url {
-                cfg.base_url = v;
-            }
-            if let Some(v) = file.default_categories {
-                cfg.default_categories = v;
-            }
-            if let Some(v) = file.default_engines {
-                cfg.default_engines = v;
-            }
-            if let Some(v) = file.language {
-                cfg.language = v;
-            }
-            if let Some(v) = file.safe_search {
-                cfg.safe_search = SafeSearch::from_u8(v);
-            }
-            if let Some(v) = file.user_agent {
-                cfg.user_agent = v;
-            }
-            if let Some(v) = file.num_results {
-                cfg.num_results = v;
-            }
-            if let Some(v) = file.timeout_secs {
-                cfg.timeout = Duration::from_secs(v);
-            }
-        }
 
         if let Ok(v) = std::env::var("SEARXNG_BASE_URL")
             && !v.trim().is_empty()
@@ -132,11 +91,6 @@ impl SearxngConfig {
         }
         if let Ok(v) = std::env::var("SEARXNG_SAFE_SEARCH") {
             cfg.safe_search = SafeSearch::from_env(&v);
-        }
-        if let Ok(v) = std::env::var("SEARXNG_USER_AGENT")
-            && !v.trim().is_empty()
-        {
-            cfg.user_agent = v;
         }
         if let Ok(v) = std::env::var("SEARXNG_NUM_RESULTS")
             && let Ok(n) = v.trim().parse::<usize>()
@@ -198,7 +152,7 @@ impl SearxngClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&cfg.user_agent).context("invalid SEARXNG_USER_AGENT")?,
+            HeaderValue::from_static(concat!("searxng-mcp/", env!("CARGO_PKG_VERSION"))),
         );
 
         let http = reqwest::ClientBuilder::new()

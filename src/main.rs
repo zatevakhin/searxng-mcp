@@ -1,8 +1,7 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::{collections::HashSet, fmt};
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser};
 use rmcp::{
     ErrorData as McpError,
     model::{CallToolResult, Content},
@@ -23,20 +22,31 @@ use rmcp::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod browse;
-mod config;
 mod searxng;
 
-#[derive(Clone, Debug, ValueEnum, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Transport {
     Stdio,
-    StreamableHttp,
+    Http,
+}
+
+impl Transport {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "stdio" => Ok(Self::Stdio),
+            "http" => Ok(Self::Http),
+            _ => Err(anyhow::anyhow!(
+                "invalid transport: {s} (valid: stdio,http)"
+            )),
+        }
+    }
 }
 
 impl std::fmt::Display for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Transport::Stdio => write!(f, "stdio"),
-            Transport::StreamableHttp => write!(f, "streamable-http"),
+            Transport::Http => write!(f, "http"),
         }
     }
 }
@@ -44,10 +54,20 @@ impl std::fmt::Display for Transport {
 #[derive(Parser)]
 #[command(name = "searxng-mcp")]
 struct Args {
-    #[arg(short = 'b', long, default_value = "127.0.0.1:3344")]
-    bind: String,
-    #[arg(short = 't', long, default_value_t = Transport::Stdio)]
-    transport: Transport,
+    #[arg(
+        short = 'b',
+        long,
+        help = "Address to bind HTTP transport (default: 127.0.0.1:3344). Also supports env SEARXNG_MCP_BIND.",
+        value_name = "HOST:PORT"
+    )]
+    bind: Option<String>,
+    #[arg(
+        short = 't',
+        long,
+        help = "MCP transport: stdio or http (default: stdio). Also supports env SEARXNG_MCP_TRANSPORT.",
+        value_name = "TRANSPORT"
+    )]
+    transport: Option<String>,
 
     #[arg(
         long,
@@ -55,9 +75,6 @@ struct Args {
         value_name = "TOOL1,TOOL2"
     )]
     tools: Option<String>,
-
-    #[arg(long, value_name = "PATH", help = "Path to a TOML config file")]
-    config: Option<PathBuf>,
 
     #[arg(
         short = 'v',
@@ -204,6 +221,7 @@ fn parse_enabled_tools(s: &str) -> anyhow::Result<HashSet<ToolName>> {
 
 #[derive(Debug, Clone)]
 pub struct SearxngMcpServer {
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     searxng: Arc<searxng::SearxngClient>,
     browse: Arc<browse::BrowseConfig>,
@@ -452,13 +470,8 @@ impl SearxngMcpServer {
 #[tool_handler]
 impl ServerHandler for SearxngMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "SearXNG MCP server (standalone). Default tools: search,browse.".into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("SearXNG MCP server (standalone). Default tools: search,browse.")
     }
 }
 
@@ -466,16 +479,10 @@ impl ServerHandler for SearxngMcpServer {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let file_cfg = if let Some(path) = args.config.as_deref() {
-        config::load_config(path)?
-    } else {
-        config::FileConfig::default()
-    };
-
-    let searxng_cfg = searxng::SearxngConfig::from_sources(file_cfg.searxng.clone());
+    let searxng_cfg = searxng::SearxngConfig::from_env();
     let searxng_client = Arc::new(searxng::SearxngClient::new(searxng_cfg)?);
 
-    let browse_cfg = Arc::new(browse::BrowseConfig::from_sources(file_cfg.browse.clone())?);
+    let browse_cfg = Arc::new(browse::BrowseConfig::from_env()?);
 
     let log_filter = if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -504,24 +511,31 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let tools_from_env = config::csv_tools_from_env();
-    let tools_from_file = file_cfg
-        .tools
-        .as_ref()
-        .map(|v| {
-            v.iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
+    let transport = match args.transport.as_deref() {
+        Some(value) => Transport::parse(value)?,
+        None => match std::env::var("SEARXNG_MCP_TRANSPORT") {
+            Ok(value) if !value.trim().is_empty() => Transport::parse(&value)?,
+            _ => Transport::Stdio,
+        },
+    };
+    let bind = args
+        .bind
+        .clone()
+        .or_else(|| {
+            std::env::var("SEARXNG_MCP_BIND")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
         })
-        .filter(|v| !v.is_empty())
-        .map(|v| v.join(","));
+        .unwrap_or_else(|| "127.0.0.1:3344".to_string());
 
     let tools_str = args
         .tools
         .clone()
-        .or(tools_from_env)
-        .or(tools_from_file)
+        .or_else(|| {
+            std::env::var("SEARXNG_MCP_TOOLS")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
         .unwrap_or_else(|| "search,browse".to_string());
     let enabled_tools = parse_enabled_tools(&tools_str)?;
 
@@ -539,11 +553,11 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    if args.transport != Transport::Stdio {
-        tracing::info!(version = VERSION, transport = %args.transport, bind = %args.bind, "server starting");
+    if transport != Transport::Stdio {
+        tracing::info!(version = VERSION, transport = %transport, bind = %bind, "server starting");
     }
 
-    match args.transport {
+    match transport {
         Transport::Stdio => {
             let enabled = enabled_tools.clone();
             let service = serve_server(
@@ -554,30 +568,25 @@ async fn main() -> anyhow::Result<()> {
             shutdown.cancelled().await;
             service.cancel().await?;
         }
-        Transport::StreamableHttp => {
+        Transport::Http => {
             let mut config = StreamableHttpServerConfig::default();
 
-            // Precedence: env > config file > defaults.
-            let file_streamable = file_cfg.streamable_http.clone().unwrap_or_default();
             let stateful_mode = std::env::var("STREAMABLE_HTTP_STATEFUL")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .or(file_streamable.stateful_mode)
                 .unwrap_or(config.stateful_mode);
             config.stateful_mode = stateful_mode;
 
             let keep_alive_secs = std::env::var("STREAMABLE_HTTP_SSE_KEEP_ALIVE")
                 .ok()
-                .and_then(|s| s.parse().ok())
-                .or(file_streamable.sse_keep_alive_secs);
+                .and_then(|s| s.parse().ok());
             if let Some(secs) = keep_alive_secs {
                 config.sse_keep_alive = Some(std::time::Duration::from_secs(secs));
             }
 
             let retry_secs = std::env::var("STREAMABLE_HTTP_SSE_RETRY")
                 .ok()
-                .and_then(|s| s.parse().ok())
-                .or(file_streamable.sse_retry_secs);
+                .and_then(|s| s.parse().ok());
             if let Some(secs) = retry_secs {
                 config.sse_retry = Some(std::time::Duration::from_secs(secs));
             }
@@ -601,7 +610,7 @@ async fn main() -> anyhow::Result<()> {
                 config,
             );
 
-            let listener = tokio::net::TcpListener::bind(&args.bind).await?;
+            let listener = tokio::net::TcpListener::bind(&bind).await?;
             let app = axum::Router::new().fallback_service(service);
             let server = axum::serve(listener, app)
                 .with_graceful_shutdown(async move { shutdown.cancelled().await });

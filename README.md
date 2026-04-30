@@ -24,7 +24,7 @@ cargo run -- --transport stdio
 Or Streamable HTTP server (recommended for networked clients):
 
 ```bash
-cargo run -- --transport streamable-http --bind 127.0.0.1:3344
+cargo run -- --transport http --bind 127.0.0.1:3344
 ```
 
 ### Nix
@@ -44,7 +44,7 @@ nix build
 Run:
 
 ```bash
-nix run . -- --transport streamable-http --bind 127.0.0.1:3344
+nix run . -- --transport http --bind 127.0.0.1:3344
 ```
 
 ### Docker Compose
@@ -62,22 +62,25 @@ This starts:
 
 ## Configuration
 
-### Config file
-
-You can provide a TOML config file:
-
-```bash
-searxng-mcp --config ./config.toml
-```
-
-Example: `config.example.toml`.
+Configuration uses CLI flags, environment variables, and built-in defaults.
 
 Precedence:
 
 - CLI flags
 - environment variables
-- config file
 - defaults
+
+### MCP server
+
+- `SEARXNG_MCP_TRANSPORT` (`stdio|http`, default: `stdio`)
+- `SEARXNG_MCP_BIND` (default: `127.0.0.1:3344`; used by `http` transport)
+- `SEARXNG_MCP_TOOLS` (comma-separated allowlist, default: `search,browse`)
+
+CLI flags still work and take precedence over environment variables:
+
+```bash
+SEARXNG_MCP_TRANSPORT=stdio searxng-mcp --transport http --bind 127.0.0.1:3344
+```
 
 ### Tool allowlist
 
@@ -103,20 +106,19 @@ export SEARXNG_MCP_TOOLS=search,browse,health
 - `SEARXNG_DEFAULT_LANGUAGE` (default: `en`)
 - `SEARXNG_SAFE_SEARCH` (`0|1|2`, default: `0`)
 - `SEARXNG_NUM_RESULTS` (default: `5`)
-- `SEARXNG_USER_AGENT` (default: `searxng-mcp/<version>`)
 - `SEARXNG_TIMEOUT_SECS` (default: `20`)
 
 ### Browse
 
 - `BROWSE_BACKEND` (`simple|obscura`, default: `simple`; `obscura` requires `--features obscura-backend`)
-- `BROWSE_OBSCURA_WAIT_UNTIL` (`load|domload|idle0|idle2`, default: `load`; Obscura backend only)
-- `BROWSE_OBSCURA_STEALTH` (`true|false|1|0|yes|no|on|off`, default: `false`; env-only; `true` requires `--features obscura-stealth`)
-- `browse.format` in config or the `browse` tool `format` argument (`markdown|text`, default: `markdown`)
+- `browse` tool `format` argument (`markdown|text`, default: `markdown`; tool argument only, not an env var or CLI flag)
+- `BROWSE_MAX_BYTES` (default: `2000000`; both backends)
+- `BROWSE_TIMEOUT_SECS` (default: `20`; both backends)
+- `BROWSE_USER_AGENT` (default: `searxng-mcp/<version>`; simple backend and Obscura non-stealth only)
 - `BROWSE_FOLLOW_REDIRECTS` (`true|false`, default: `false`; simple backend only)
 - `BROWSE_MAX_REDIRECTS` (default: `10`; simple backend only)
-- `BROWSE_MAX_BYTES` (default: `2000000`)
-- `BROWSE_TIMEOUT_SECS` (default: `20`)
-- `BROWSE_USER_AGENT` (default: `searxng-mcp/<version>`)
+- `BROWSE_OBSCURA_WAIT_UNTIL` (`load|domload|idle0|idle2`, default: `load`; Obscura backend only)
+- `BROWSE_OBSCURA_STEALTH` (`true|false|1|0|yes|no|on|off`, default: `false`; Obscura backend only; env-only; `true` requires `--features obscura-stealth`)
 
 SSRF controls:
 
@@ -127,7 +129,9 @@ Notes:
 
 - If `BROWSE_ALLOWED_HOSTS` is set, it overrides private/localhost blocking.
 - If no allowlist is set, `browse` blocks localhost and private/loopback/link-local IPs by default.
-- The Obscura backend uses the in-process Rust API and its navigation wait mode is controlled by `BROWSE_OBSCURA_WAIT_UNTIL`.
+- Simple backend redirect options are `BROWSE_FOLLOW_REDIRECTS` and `BROWSE_MAX_REDIRECTS`; Obscura handles navigation internally.
+- Obscura wait and stealth options are `BROWSE_OBSCURA_WAIT_UNTIL` and `BROWSE_OBSCURA_STEALTH`.
+- Obscura stealth mode does not apply `BROWSE_USER_AGENT`; it uses Obscura's own stealth user-agent/client behavior.
 - Enable `browse_eval` with `--tools search,browse,browse_eval` only when using `BROWSE_BACKEND=obscura`.
 
 Build with Obscura support:
@@ -199,19 +203,29 @@ Example flake-based NixOS config:
           services.searxng-mcp.listenAddress = "127.0.0.1";
           services.searxng-mcp.port = 3344;
 
-          services.searxng-mcp.environment = {
-            SEARXNG_BASE_URL = "http://localhost:8080";
-            SEARXNG_DEFAULT_ENGINES = "duckduckgo,startpage";
+          services.searxng-mcp.tools = ["search" "browse" "health"];
+
+          services.searxng-mcp.searxng = {
+            baseUrl = "http://localhost:8080";
+            defaultEngines = ["duckduckgo" "startpage"];
           };
 
-          # Optional: enable extra tools
-          services.searxng-mcp.tools = ["search" "browse" "health"];
+          services.searxng-mcp.browse.backend = "obscura";
+          services.searxng-mcp.obscura = {
+            waitUntil = "load";
+            stealth = true;
+          };
         })
       ];
     };
   };
 }
 ```
+
+## Credits
+
+- [SearXNG](https://github.com/searxng/searxng) powers metasearch.
+- [Obscura](https://github.com/h4ckf0r0day/obscura) provides the optional rendered browse backend.
 
 ## License
 

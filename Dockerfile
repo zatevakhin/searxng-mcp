@@ -26,5 +26,7 @@ USER 10001
 
 EXPOSE 3344
 
+ENV SEARXNG_MCP_TRANSPORT=http \
+    SEARXNG_MCP_BIND=0.0.0.0:3344
+
 ENTRYPOINT ["/usr/local/bin/searxng-mcp"]
-CMD ["--transport","streamable-http","--bind","0.0.0.0:3344"]
